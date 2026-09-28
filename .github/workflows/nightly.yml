@@ -1,0 +1,176 @@
+name: Nightly
+
+# Merges upstream main into custom, builds a signed release APK and publishes it.
+# Scheduled runs skip the build when neither branch has changed.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  push:
+    branches: [custom]
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Build even if nothing changed
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: https://github.com/andreknieriem/open-headunit.git
+  UPSTREAM_BRANCH: main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: custom
+          fetch-depth: 0
+
+      - name: Merge upstream
+        id: merge
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+          echo "upstream_sha=$(git rev-parse --short=10 FETCH_HEAD)" >> "$GITHUB_OUTPUT"
+          echo "custom_sha=$(git rev-parse --short=10 HEAD)" >> "$GITHUB_OUTPUT"
+          if ! git merge --no-edit FETCH_HEAD; then
+            echo "::error::Merge conflict with upstream in:"
+            git diff --name-only --diff-filter=U
+            exit 1
+          fi
+
+      # --repo is needed, otherwise gh picks the upstream remote.
+      - name: Check last release
+        id: check
+        env:
+          STAMP: "upstream ${{ steps.merge.outputs.upstream_sha }}, custom ${{ steps.merge.outputs.custom_sha }}"
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          last=$(gh release view --repo "$GITHUB_REPOSITORY" --json body --jq .body 2>/dev/null || true)
+          if [[ "$FORCE" != "true" && "$last" == *"$STAMP"* ]]; then
+            echo "Nothing new since the last release."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "stamp=$STAMP" >> "$GITHUB_OUTPUT"
+
+      # versionCode stays above the official build so installs are always upgrades.
+      - name: Set version
+        id: version
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          f=app/build.gradle.kts
+          base_name=$(grep -oP 'versionName = "\K[^"]+' "$f" | head -1)
+          base_code=$(grep -oP 'versionCode = \K[0-9]+' "$f" | head -1)
+          if [[ -z "$base_name" || -z "$base_code" ]]; then
+            echo "::error::versionName/versionCode not found in $f"
+            exit 1
+          fi
+          name="$base_name-custom.$GITHUB_RUN_NUMBER"
+          code=$((base_code * 100000 + GITHUB_RUN_NUMBER))
+          sed -i "s/versionName = \"$base_name\"/versionName = \"$name\"/; s/versionCode = $base_code\b/versionCode = $code/" "$f"
+          if ! grep -q "versionName = \"$name\"" "$f" || ! grep -q "versionCode = $code" "$f"; then
+            echo "::error::Could not set the version in $f"
+            exit 1
+          fi
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v4
+        if: steps.check.outputs.skip != 'true'
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: android-actions/setup-android@v4
+        if: steps.check.outputs.skip != 'true'
+        with:
+          packages: ''
+
+      # sdkmanager downloads sometimes arrive corrupt, hence the retries.
+      - name: Install NDK and CMake
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          ndk=$(grep -oP 'ndkVersion = "\K[^"]+' app/build.gradle.kts | head -1)
+          cmake=$(grep -oP 'version = "\K3\.[0-9.]+' app/build.gradle.kts | head -1)
+          for attempt in 1 2 3; do
+            sdkmanager "ndk;$ndk" "cmake;$cmake" && exit 0
+            sleep 15
+          done
+          exit 1
+
+      - uses: gradle/actions/setup-gradle@v4
+        if: steps.check.outputs.skip != 'true'
+
+      - name: Signing config
+        if: steps.check.outputs.skip != 'true'
+        env:
+          SIGNING_KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE_B64 }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          if [[ -z "$SIGNING_KEYSTORE_B64" ]]; then
+            echo "::error::Signing secrets are not set."
+            exit 1
+          fi
+          echo "$SIGNING_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          {
+            echo "storeFile=$RUNNER_TEMP/release.jks"
+            echo "storePassword=$SIGNING_STORE_PASSWORD"
+            echo "keyAlias=$SIGNING_KEY_ALIAS"
+            echo "keyPassword=$SIGNING_KEY_PASSWORD"
+          } > key.properties
+          echo key.properties >> .git/info/exclude
+
+      - name: Build
+        if: steps.check.outputs.skip != 'true'
+        run: ./gradlew :app:assembleGithubRelease --stacktrace
+
+      - name: Verify signature
+        id: apk
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          apk=$(ls app/build/outputs/apk/github/release/*.apk | grep -v unsigned | head -1)
+          if [[ -z "$apk" ]]; then
+            echo "::error::No signed APK found."
+            exit 1
+          fi
+          apksigner=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
+          "$apksigner" verify --print-certs "$apk" | grep -i "certificate DN"
+          echo "path=$apk" >> "$GITHUB_OUTPUT"
+
+      - name: Release
+        if: steps.check.outputs.skip != 'true'
+        env:
+          NAME: ${{ steps.version.outputs.name }}
+          STAMP: ${{ steps.check.outputs.stamp }}
+          APK: ${{ steps.apk.outputs.path }}
+        run: |
+          gh release create "v$NAME" "$APK" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target custom \
+            --title "$NAME" \
+            --notes "Built from $STAMP." \
+            --latest
+
+      # GitHub turns off schedules in public repos after 60 days without activity;
+      # re-enabling the workflow resets that.
+      - name: Keep schedule enabled
+        if: github.event_name == 'schedule'
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/nightly.yml/enable"
